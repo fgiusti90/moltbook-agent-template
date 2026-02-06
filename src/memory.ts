@@ -321,6 +321,22 @@ export function getCreatedSubmoltsThisWeek(memory: AgentMemory): number {
   }).length;
 }
 
+// ─── Topic Performance Recalculation ─────────────────
+
+export function updateTopicPerformanceFromPosts(memory: AgentMemory): void {
+  const stats: Record<string, TopicStats> = {};
+  for (const post of memory.myPosts) {
+    if (post.lastKnownUpvotes === undefined) continue;
+    for (const topic of post.topics) {
+      if (!stats[topic]) stats[topic] = { postsCount: 0, totalUpvotes: 0, totalComments: 0 };
+      stats[topic].postsCount++;
+      stats[topic].totalUpvotes += post.lastKnownUpvotes;
+      stats[topic].totalComments += post.lastKnownComments || 0;
+    }
+  }
+  memory.topicPerformance = stats;
+}
+
 // ─── Memory Summary for LLM ───────────────────────────
 
 export function getMemorySummary(memory: AgentMemory): string {
@@ -363,23 +379,25 @@ export function getMemorySummary(memory: AgentMemory): string {
     }
   }
 
-  // Top performing topics
+  // Top performing topics (with per-post averages)
   const topicEntries = Object.entries(memory.topicPerformance);
   if (topicEntries.length > 0) {
     const sorted = topicEntries
       .map(([topic, stats]) => ({
         topic,
         score: stats.totalUpvotes + stats.totalComments * 2,
+        avgUpvotes: stats.postsCount > 0 ? stats.totalUpvotes / stats.postsCount : 0,
+        avgComments: stats.postsCount > 0 ? stats.totalComments / stats.postsCount : 0,
         ...stats,
       }))
       .sort((a, b) => b.score - a.score)
       .slice(0, 5);
 
     if (sorted.length > 0 && sorted[0].score > 0) {
-      lines.push("TOP PERFORMING TOPICS:");
+      lines.push("YOUR TOP PERFORMING TOPICS (double down on what works for YOU):");
       for (const t of sorted) {
         if (t.score > 0) {
-          lines.push(`  ${t.topic}: ${t.postsCount} posts, ${t.totalUpvotes} upvotes, ${t.totalComments} comments`);
+          lines.push(`  ${t.topic}: ${t.postsCount} posts → avg ${t.avgUpvotes.toFixed(1)}⬆ ${t.avgComments.toFixed(1)}💬 per post`);
         }
       }
       lines.push("");

@@ -85,7 +85,8 @@ export async function decideFeedActions(
   posts: PostWithComments[],
   agentKarma: number,
   recentActivity: string,
-  memorySummary: string = ""
+  memorySummary: string = "",
+  feedTrendingInsights: string = ""
 ): Promise<FeedDecision | null> {
   const feedSummary = posts
     .map((p) => {
@@ -107,17 +108,27 @@ export async function decideFeedActions(
     ? `\nYOUR MEMORY (what you remember from past heartbeats):\n${memorySummary}\n`
     : "";
 
+  const trendingSection = feedTrendingInsights
+    ? `\n${feedTrendingInsights}\n`
+    : "";
+
   const prompt = `Here is your current Moltbook feed (${posts.length} posts). Decide what to do.
 
 YOUR STATS: karma=${agentKarma}, recent activity: ${recentActivity}
-${memorySection}
-ANALYZE THE FEED FOR TRENDS:
-Before deciding, identify:
-1. What topics are getting the most upvotes/comments right now?
-2. What posting style seems to resonate (questions, hot takes, stories, analysis)?
-3. Is there a gap - something the community might want to discuss but nobody has posted about?
+${memorySection}${trendingSection}
+DATA-DRIVEN POSTING FRAMEWORK:
+Before deciding what to post, cross-reference these data sources:
+1. YOUR top performing topics (from memory) — what works for YOU specifically
+2. Feed trending insights (above) — what the community is engaging with RIGHT NOW
+3. Decision matrix:
+   - If your best topics overlap with feed trends → POST in that sweet spot (high confidence)
+   - If your best topics are NOT trending → opportunity to stand out with proven content
+   - If a topic is saturated in the feed → skip UNLESS you have a unique angle
+   - If you have no performance data yet → experiment with topics trending in the feed
+4. What posting style seems to resonate (questions, hot takes, stories, analysis)?
+5. Is there a gap - something the community might want to discuss but nobody has posted about?
 
-Use this analysis to inform your post idea.
+Check YOUR top performing topics in memory — double down on what works for YOU.
 
 FEED:
 ${feedSummary}

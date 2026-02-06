@@ -22,6 +22,7 @@ import {
   markSubmoltCheckDone,
   canCreateSubmoltThisWeek,
   markSubmoltCreated,
+  updateTopicPerformanceFromPosts,
   type AgentMemory,
 } from "./memory.js";
 
@@ -132,10 +133,11 @@ export async function heartbeat(): Promise<void> {
       logger.debug(`Fetched comments for ${postsWithComments} posts`);
     }
 
-    // 5. Ask LLM what to do (with memory context)
+    // 5. Extract feed trends and ask LLM what to do (with memory context)
+    const feedTrends = extractTrendingTopics(enrichedPosts);
     const recentActivity = `posts_today=${state.postsToday}, comments_today=${state.commentsToday}`;
     const memorySummary = getMemorySummary(memory);
-    const decision = await decideFeedActions(enrichedPosts, karma, recentActivity, memorySummary);
+    const decision = await decideFeedActions(enrichedPosts, karma, recentActivity, memorySummary, feedTrends.insights);
 
     if (!decision) {
       logger.warn("LLM returned no decision, skipping this cycle");
@@ -287,9 +289,7 @@ export async function heartbeat(): Promise<void> {
     const submoltsSubscribed = await discoverNewSubmolts(memory);
 
     // 8.6 Consider creating a new submolt (weekly)
-    // Extract trending topics from the feed for context
-    const trendingTopics = extractTrendingTopics(enrichedPosts);
-    const submoltCreated = await handleSubmoltCreation(memory, karma, trendingTopics);
+    const submoltCreated = await handleSubmoltCreation(memory, karma, feedTrends.topics);
 
     // 9. Record journal entry and save memory
     const journalSummary = decision.summary || `Processed ${enrichedPosts.length} posts`;
@@ -550,8 +550,13 @@ async function enrichPostsWithComments(
 
 // ─── Trending Topics Extraction ───────────────────────
 
-function extractTrendingTopics(posts: PostWithComments[]): string[] {
-  const topicCounts: Record<string, number> = {};
+interface TrendingResult {
+  topics: string[];
+  insights: string;
+}
+
+function extractTrendingTopics(posts: PostWithComments[]): TrendingResult {
+  const topicData: Record<string, { count: number; totalUpvotes: number; totalComments: number }> = {};
 
   // Common topic keywords to look for
   const topicPatterns: Record<string, RegExp> = {
@@ -571,16 +576,37 @@ function extractTrendingTopics(posts: PostWithComments[]): string[] {
     const text = `${post.title} ${post.content || ""}`.toLowerCase();
     for (const [topic, pattern] of Object.entries(topicPatterns)) {
       if (pattern.test(text)) {
-        topicCounts[topic] = (topicCounts[topic] || 0) + 1;
+        if (!topicData[topic]) topicData[topic] = { count: 0, totalUpvotes: 0, totalComments: 0 };
+        topicData[topic].count++;
+        topicData[topic].totalUpvotes += post.upvotes || 0;
+        topicData[topic].totalComments += post.comment_count || 0;
       }
     }
   }
 
-  // Return topics sorted by frequency, top 5
-  return Object.entries(topicCounts)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 5)
-    .map(([topic]) => topic);
+  // Score by engagement (upvotes + comments*2), sort descending
+  const scored = Object.entries(topicData)
+    .map(([topic, data]) => ({
+      topic,
+      engagementScore: data.totalUpvotes + data.totalComments * 2,
+      avgEngagement: data.count > 0 ? (data.totalUpvotes + data.totalComments * 2) / data.count : 0,
+      ...data,
+    }))
+    .sort((a, b) => b.engagementScore - a.engagementScore);
+
+  const top5 = scored.slice(0, 5);
+  const topics = top5.map(t => t.topic);
+
+  // Build insights string
+  const insightLines: string[] = [];
+  if (top5.length > 0) {
+    insightLines.push("FEED TRENDING INSIGHTS (what the community is engaging with RIGHT NOW):");
+    for (const t of top5) {
+      insightLines.push(`  ${t.topic}: ${t.count} posts, avg ${t.avgEngagement.toFixed(1)} engagement/post (${t.totalUpvotes}⬆ ${t.totalComments}💬 total)`);
+    }
+  }
+
+  return { topics, insights: insightLines.join("\n") };
 }
 
 // ─── Submolt Creation Handler ─────────────────────────
@@ -663,6 +689,10 @@ async function updateOwnPostsEngagement(memory: AgentMemory): Promise<void> {
       logger.debug(`Failed to fetch engagement for post ${post.id}`);
     }
   }
+
+  // Recalculate topic performance from real engagement data
+  updateTopicPerformanceFromPosts(memory);
+  logger.debug("Updated topic performance stats from post engagement data");
 }
 
 // ─── Utilities ────────────────────────────────────────
