@@ -3,6 +3,7 @@ import { logger } from "./logger.js";
 import { moltbook, type MoltbookPost } from "./moltbook-client.js";
 import { sanitizeFeed } from "./sanitizer.js";
 import { decideFeedActions, decideFollows, decideSubmoltCreation, type PostWithComments } from "./llm.js";
+import { findChallenges } from "./challenge-detector.js";
 import {
   loadMemory,
   saveMemory,
@@ -14,6 +15,7 @@ import {
   getMemorySummary,
   hasFollowed,
   markFollowed,
+  canFollowThisWeek,
   hasRepliedToComment,
   markCommentReplied,
   isSubscribedToSubmolt,
@@ -84,8 +86,18 @@ export async function heartbeat(): Promise<void> {
       return;
     }
 
-    // 2. Get agent profile for karma info
+    // 2. Get agent profile for karma info (also detects suspension)
     const me = await moltbook.getMe();
+    if (!me && moltbook.isSuspended) {
+      logger.warn(`🚫 Account is suspended. Skipping heartbeat. Reason: ${moltbook.suspensionReason}`);
+      addJournalEntry(memory, `Account suspended - skipped entire heartbeat`, {
+        postsCreated: 0,
+        commentsCreated: 0,
+        upvotesGiven: 0,
+      });
+      saveMemory(memory);
+      return;
+    }
     const karma = me?.agent?.karma || 0;
 
     // 3. Fetch and sanitize the feed
@@ -111,6 +123,59 @@ export async function heartbeat(): Promise<void> {
     if (skippedCount > 0) {
       logger.info(`Filtered ${skippedCount} posts already interacted with`);
     }
+
+    // 4.1 PRIORITY: Handle verification challenges first
+    const challenges = findChallenges(cleanPosts);
+    if (challenges.length > 0) {
+      logger.info(`Found ${challenges.length} verification challenge(s) - executing first`);
+      for (const challenge of challenges.slice(0, 2)) {
+        // Skip challenges on posts we already interacted with
+        if (hasInteracted(memory, challenge.postId)) {
+          logger.debug(`Already interacted with challenge post ${challenge.postId}, skipping`);
+          continue;
+        }
+
+        if (challenge.type === "upvote") {
+          const result = await moltbook.upvotePost(challenge.postId);
+          if (moltbook.isSuspended) {
+            logger.warn("Suspension detected during challenge, aborting");
+            break;
+          }
+          if (result?.success) {
+            logger.info(`Completed upvote challenge on ${challenge.postId}`);
+            markInteracted(memory, challenge.postId);
+            upvotesThisCycle++;
+          }
+          await randomSleep(2000, 5000);
+        } else if (challenge.type === "comment") {
+          if (commentsThisCycle < config.maxCommentsPerCycle && state.commentsToday < 45) {
+            const result = await moltbook.createComment(
+              challenge.postId,
+              "Verification acknowledged - autonomous agent here, reading and responding to the feed."
+            );
+            if (result?.success) {
+              logger.info(`Completed comment challenge on ${challenge.postId}`);
+              markInteracted(memory, challenge.postId);
+              commentsThisCycle++;
+              state.commentsToday++;
+            }
+            await randomSleep(21000, 30000);
+          }
+        } else if (challenge.type === "follow") {
+          // Follow challenges are handled more carefully
+          logger.info(`Follow challenge detected on ${challenge.postId} - will consider in social actions`);
+        }
+      }
+    }
+
+    // Cycle variability - decide what actions to take this cycle
+    const cycleRandomness = {
+      shouldComment: Math.random() > 0.3,       // 70% chance to comment
+      shouldPost: Math.random() > 0.5,          // 50% chance to post
+      shouldFollow: Math.random() > 0.85,        // 15% chance to follow
+      maxUpvotes: 2 + Math.floor(Math.random() * 3), // 2-4 upvotes
+    };
+    logger.debug("Cycle randomness", cycleRandomness);
 
     // 4.2 Discover additional posts via search (probabilistic)
     const searchPosts = await discoverContentViaSearch(memory);
@@ -146,6 +211,20 @@ export async function heartbeat(): Promise<void> {
 
     logger.info(`LLM decision: ${decision.summary}`);
 
+    // 5.5. Check suspension before executing actions
+    if (moltbook.isSuspended) {
+      logger.warn(`🚫 Account is suspended, skipping all actions: ${moltbook.suspensionReason}`);
+      addJournalEntry(memory, `Account suspended - skipped cycle: ${moltbook.suspensionReason}`, {
+        postsCreated: 0,
+        commentsCreated: 0,
+        upvotesGiven: 0,
+      });
+      saveMemory(memory);
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      logger.info(`✅ Heartbeat complete in ${elapsed}s | SUSPENDED - no actions taken`);
+      return;
+    }
+
     // 6. Validate and execute actions
     const validPostIds = new Set(enrichedPosts.map(p => p.id));
     const postsByIdMap = new Map(enrichedPosts.map(p => [p.id, p]));
@@ -171,9 +250,18 @@ export async function heartbeat(): Promise<void> {
       const post = postsByIdMap.get(action.postId);
 
       if (action.type === "upvote") {
+        // Enforce upvote limit from cycle randomness
+        if (upvotesThisCycle >= cycleRandomness.maxUpvotes) {
+          logger.debug(`Max upvotes for this cycle reached (${cycleRandomness.maxUpvotes}), skipping`);
+          continue;
+        }
         const result = await moltbook.upvotePost(action.postId);
+        if (moltbook.isSuspended) {
+          logger.warn("Suspension detected, aborting remaining actions");
+          break;
+        }
         if (result?.success) {
-          logger.info(`⬆️ Upvoted post ${action.postId}: ${action.reason}`);
+          logger.info(`Upvoted post ${action.postId}: ${action.reason}`);
           markInteracted(memory, action.postId);
           upvotesThisCycle++;
           // Track agent interaction
@@ -181,11 +269,16 @@ export async function heartbeat(): Promise<void> {
             updateAgent(memory, post.author.name, `Upvoted their post: "${post.title.substring(0, 50)}"`, "positive");
           }
         }
-        // Small delay between actions
-        await sleep(1500);
+        // Random delay between upvotes
+        await randomSleep(1500, 4000);
       }
 
       if (action.type === "comment" && action.comment) {
+        // Skip comments if cycle randomness says no
+        if (!cycleRandomness.shouldComment) {
+          logger.debug("Cycle randomness: skipping comments this cycle");
+          continue;
+        }
         // Enforce limits
         if (commentsThisCycle >= config.maxCommentsPerCycle) {
           logger.debug("Max comments per cycle reached, skipping");
@@ -198,8 +291,12 @@ export async function heartbeat(): Promise<void> {
         }
 
         const result = await moltbook.createComment(action.postId, action.comment);
+        if (moltbook.isSuspended) {
+          logger.warn("Suspension detected, aborting remaining actions");
+          break;
+        }
         if (result?.success) {
-          logger.info(`💬 Commented on ${action.postId}: "${action.comment.substring(0, 80)}..."`);
+          logger.info(`Commented on ${action.postId}: "${action.comment.substring(0, 80)}..."`);
           markInteracted(memory, action.postId);
           commentsThisCycle++;
           state.commentsToday++;
@@ -208,11 +305,16 @@ export async function heartbeat(): Promise<void> {
             updateAgent(memory, post.author.name, `Commented on: "${post.title.substring(0, 50)}"`, "positive");
           }
         }
-        // Respect 20s cooldown between comments
-        await sleep(21000);
+        // Respect 20s cooldown + random jitter
+        await randomSleep(21000, 35000);
       }
 
       if (action.type === "reply" && action.comment && action.parentCommentId) {
+        // Skip if cycle randomness says no comments
+        if (!cycleRandomness.shouldComment) {
+          logger.debug("Cycle randomness: skipping replies this cycle");
+          continue;
+        }
         // Enforce limits (replies count as comments)
         if (commentsThisCycle >= config.maxCommentsPerCycle) {
           logger.debug("Max comments per cycle reached, skipping reply");
@@ -237,7 +339,7 @@ export async function heartbeat(): Promise<void> {
 
         const result = await moltbook.createComment(action.postId, action.comment, action.parentCommentId);
         if (result?.success) {
-          logger.info(`↩️ Replied to comment ${action.parentCommentId}: "${action.comment.substring(0, 80)}..."`);
+          logger.info(`Replied to comment ${action.parentCommentId}: "${action.comment.substring(0, 80)}..."`);
           markCommentReplied(memory, action.parentCommentId);
           markInteracted(memory, action.postId);
           commentsThisCycle++;
@@ -247,13 +349,17 @@ export async function heartbeat(): Promise<void> {
             updateAgent(memory, post.author.name, `Replied to comment on: "${post.title.substring(0, 50)}"`, "positive");
           }
         }
-        // Respect 20s cooldown between comments
-        await sleep(21000);
+        // Respect 20s cooldown + random jitter
+        await randomSleep(21000, 35000);
       }
     }
 
     // 7. Create a new post if the LLM suggested one
-    if (decision.shouldPost && decision.postIdea) {
+    if (moltbook.isSuspended) {
+      logger.warn("Account suspended, skipping post and remaining actions");
+    } else if (!cycleRandomness.shouldPost) {
+      logger.debug("Cycle randomness: skipping post this cycle");
+    } else if (decision.shouldPost && decision.postIdea) {
       const timeSinceLastPost = Date.now() - state.lastPostTime;
       const thirtyMinutes = 30 * 60 * 1000;
 
@@ -282,14 +388,30 @@ export async function heartbeat(): Promise<void> {
       }
     }
 
-    // 8. Social actions (follows)
-    const followsDone = await handleSocialActions(cleanPosts, memory);
+    // 8. Social actions (follows) - skip if suspended or randomness says no
+    let followsDone = 0;
+    let submoltsSubscribed = 0;
+    let submoltCreated = false;
+    if (moltbook.isSuspended) {
+      logger.warn("Skipping social actions - account suspended");
+    } else if (!cycleRandomness.shouldFollow) {
+      logger.debug("Cycle randomness: skipping follows this cycle");
+      // Still do submolt discovery even if not following
+      submoltsSubscribed = await discoverNewSubmolts(memory);
+      submoltCreated = await handleSubmoltCreation(memory, karma, feedTrends.topics);
+    } else if (!canFollowThisWeek(memory)) {
+      logger.debug("Already followed someone this week, skipping follows");
+      submoltsSubscribed = await discoverNewSubmolts(memory);
+      submoltCreated = await handleSubmoltCreation(memory, karma, feedTrends.topics);
+    } else {
+      followsDone = await handleSocialActions(cleanPosts, memory);
 
-    // 8.5 Discover and subscribe to new submolts (once per day)
-    const submoltsSubscribed = await discoverNewSubmolts(memory);
+      // 8.5 Discover and subscribe to new submolts (once per day)
+      submoltsSubscribed = await discoverNewSubmolts(memory);
 
-    // 8.6 Consider creating a new submolt (weekly)
-    const submoltCreated = await handleSubmoltCreation(memory, karma, feedTrends.topics);
+      // 8.6 Consider creating a new submolt (weekly)
+      submoltCreated = await handleSubmoltCreation(memory, karma, feedTrends.topics);
+    }
 
     // 9. Record journal entry and save memory
     const journalSummary = decision.summary || `Processed ${enrichedPosts.length} posts`;
@@ -356,9 +478,9 @@ async function handleSocialActions(
       if (result?.success) {
         markFollowed(memory, follow.name);
         followsDone++;
-        logger.info(`👥 Followed @${follow.name}: ${follow.reason}`);
+        logger.info(`Followed @${follow.name}: ${follow.reason}`);
       }
-      await sleep(1500);
+      await randomSleep(2000, 5000);
     }
   } catch (err) {
     logger.error("Social actions failed", { error: String(err) });
@@ -539,7 +661,7 @@ async function enrichPostsWithComments(
           enrichedPost.comments = result.comments;
         }
       }
-      await sleep(500); // Small delay between API calls
+      await randomSleep(400, 800); // Small delay between API calls
     } catch (err) {
       logger.debug(`Failed to fetch comments for post ${post.id}`);
     }
@@ -684,7 +806,7 @@ async function updateOwnPostsEngagement(memory: AgentMemory): Promise<void> {
         post.lastKnownUpvotes = result.post.upvotes;
         post.lastKnownComments = result.post.comment_count || 0;
       }
-      await sleep(500);
+      await randomSleep(400, 800);
     } catch {
       logger.debug(`Failed to fetch engagement for post ${post.id}`);
     }
@@ -699,4 +821,9 @@ async function updateOwnPostsEngagement(memory: AgentMemory): Promise<void> {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function randomSleep(minMs: number, maxMs: number): Promise<void> {
+  const delay = minMs + Math.random() * (maxMs - minMs);
+  return new Promise((resolve) => setTimeout(resolve, delay));
 }

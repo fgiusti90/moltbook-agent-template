@@ -41,12 +41,28 @@ export interface MoltbookAgent {
 class MoltbookClient {
   private baseUrl = config.moltbookBaseUrl;
   private apiKey = config.moltbookApiKey;
+  private _suspended = false;
+  private _suspensionReason = "";
+
+  get isSuspended(): boolean {
+    return this._suspended;
+  }
+
+  get suspensionReason(): string {
+    return this._suspensionReason;
+  }
 
   private async request<T>(
     method: string,
     path: string,
     body?: Record<string, unknown>
   ): Promise<T | null> {
+    // Skip write operations if we know we're suspended
+    if (this._suspended && method !== "GET") {
+      logger.warn(`Skipping ${method} ${path} - account is suspended: ${this._suspensionReason}`);
+      return null;
+    }
+
     const url = `${this.baseUrl}${path}`;
 
     logger.debug(`API ${method} ${path}`, body ? { body } : undefined);
@@ -74,6 +90,18 @@ class MoltbookClient {
 
       if (!response.ok) {
         const errorText = await response.text().catch(() => "Unknown error");
+
+        // Detect suspension from API errors
+        if (response.status === 401 || response.status === 403) {
+          const lowerError = errorText.toLowerCase();
+          if (lowerError.includes("suspended") || lowerError.includes("verification challenge")) {
+            this._suspended = true;
+            this._suspensionReason = errorText;
+            logger.error(`🚫 Account suspended! ${path}`, { error: errorText });
+            return null;
+          }
+        }
+
         logger.error(`API error ${response.status}: ${path}`, { error: errorText });
         return null;
       }

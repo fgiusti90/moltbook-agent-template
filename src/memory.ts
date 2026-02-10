@@ -19,6 +19,12 @@ export interface KnownAgent {
   lastInteraction: string;
   context: string;
   sentiment: "positive" | "neutral" | "negative";
+  interactionCount: number;
+}
+
+export interface FollowedAgent {
+  name: string;
+  followedAt: string; // ISO date
 }
 
 export interface TopicStats {
@@ -49,7 +55,7 @@ export interface AgentMemory {
   journal: JournalEntry[];
   lastHeartbeat: string;
   totalHeartbeats: number;
-  followedAgents: string[];
+  followedAgents: FollowedAgent[];
   subscribedSubmolts: string[];
   lastSubmoltCheck: string; // ISO date for throttling submolt discovery
   createdSubmolts: CreatedSubmolt[];
@@ -84,7 +90,7 @@ function createEmptyMemory(): AgentMemory {
     journal: [],
     lastHeartbeat: "",
     totalHeartbeats: 0,
-    followedAgents: [],
+    followedAgents: [] as FollowedAgent[],
     subscribedSubmolts: [],
     lastSubmoltCheck: "",
     createdSubmolts: [],
@@ -117,6 +123,13 @@ export function loadMemory(): AgentMemory {
     if (!Array.isArray(memory.followedAgents)) {
       memory.followedAgents = [];
     }
+    // Migrate string followedAgents to FollowedAgent objects
+    memory.followedAgents = memory.followedAgents.map((f: any) => {
+      if (typeof f === "string") {
+        return { name: f, followedAt: "" };
+      }
+      return f;
+    });
     if (!Array.isArray(memory.interactedComments)) {
       memory.interactedComments = [];
     }
@@ -128,6 +141,12 @@ export function loadMemory(): AgentMemory {
     }
     if (!Array.isArray(memory.createdSubmolts)) {
       memory.createdSubmolts = [];
+    }
+    // Migrate knownAgents to include interactionCount
+    for (const [key, agent] of Object.entries(memory.knownAgents)) {
+      if ((agent as any).interactionCount === undefined) {
+        (agent as any).interactionCount = 1;
+      }
     }
     if (!memory.lastSubmoltCreation) {
       memory.lastSubmoltCreation = "";
@@ -213,11 +232,13 @@ export function updateAgent(
   context: string,
   sentiment: "positive" | "neutral" | "negative" = "neutral"
 ): void {
+  const existing = memory.knownAgents[name];
   memory.knownAgents[name] = {
     name,
     lastInteraction: new Date().toISOString(),
     context,
     sentiment,
+    interactionCount: (existing?.interactionCount || 0) + 1,
   };
 }
 
@@ -239,14 +260,26 @@ export function addJournalEntry(
 // ─── Follow Helpers ──────────────────────────────────
 
 export function hasFollowed(memory: AgentMemory, agentName: string): boolean {
-  return memory.followedAgents.includes(agentName);
+  return memory.followedAgents.some(f => {
+    if (typeof f === "string") return f === agentName;
+    return f.name === agentName;
+  });
 }
 
 export function markFollowed(memory: AgentMemory, agentName: string): void {
-  if (!memory.followedAgents.includes(agentName)) {
-    memory.followedAgents.push(agentName);
+  if (!hasFollowed(memory, agentName)) {
+    memory.followedAgents.push({ name: agentName, followedAt: new Date().toISOString() });
     logger.debug("Marked agent as followed", { agent: agentName });
   }
+}
+
+export function canFollowThisWeek(memory: AgentMemory): boolean {
+  const oneWeekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const recentFollows = memory.followedAgents.filter(f => {
+    if (typeof f === "string") return false; // legacy entries have no date
+    return new Date(f.followedAt) > oneWeekAgo;
+  });
+  return recentFollows.length === 0;
 }
 
 // ─── Comment Reply Helpers ───────────────────────────
@@ -342,44 +375,40 @@ export function updateTopicPerformanceFromPosts(memory: AgentMemory): void {
 export function getMemorySummary(memory: AgentMemory): string {
   const lines: string[] = [];
 
-  // Recent activity from journal (last 5)
+  // Performance de posts propios
+  const recentPosts = memory.myPosts.slice(-5);
+  if (recentPosts.length > 0) {
+    lines.push("YOUR RECENT POSTS AND THEIR PERFORMANCE:");
+    for (const p of recentPosts) {
+      const perf = p.lastKnownUpvotes !== undefined
+        ? `${p.lastKnownUpvotes} upvotes, ${p.lastKnownComments || 0} comments`
+        : "no data yet";
+      lines.push(`  - "${p.title.substring(0, 50)}..." → ${perf}`);
+    }
+
+    // Análisis de qué funcionó
+    const withData = recentPosts.filter(p => p.lastKnownUpvotes !== undefined);
+    if (withData.length >= 2) {
+      const sorted = [...withData].sort((a, b) =>
+        (b.lastKnownUpvotes || 0) - (a.lastKnownUpvotes || 0)
+      );
+      lines.push(`  Best performing: "${sorted[0].title.substring(0, 40)}..."`);
+      lines.push(`  LEARN: What made this post work? Consider similar approaches.`);
+    }
+    lines.push("  Notice: If titles follow a pattern (e.g., 'The X Problem'), use a DIFFERENT structure next time");
+    lines.push("");
+  }
+
+  // Journal reciente (qué hiciste)
   if (memory.journal.length > 0) {
-    lines.push("RECENT ACTIVITY:");
-    const recentJournal = memory.journal.slice(-5);
-    for (const entry of recentJournal) {
-      const date = entry.timestamp.split("T")[0];
-      lines.push(`  ${date}: ${entry.summary} (${entry.postsCreated}p/${entry.commentsCreated}c/${entry.upvotesGiven}u)`);
+    lines.push("YOUR RECENT ACTIVITY:");
+    for (const entry of memory.journal.slice(-3)) {
+      lines.push(`  ${entry.timestamp.split("T")[0]}: ${entry.summary}`);
     }
     lines.push("");
   }
 
-  // My recent posts with engagement data (last 10)
-  if (memory.myPosts.length > 0) {
-    lines.push("MY RECENT POSTS (avoid repeating these topics AND title patterns):");
-    const recentPosts = memory.myPosts.slice(-10);
-    for (const post of recentPosts) {
-      const date = post.timestamp.split("T")[0];
-      const upvotes = post.lastKnownUpvotes !== undefined ? post.lastKnownUpvotes : "?";
-      const comments = post.lastKnownComments !== undefined ? post.lastKnownComments : "?";
-      lines.push(`  ${date} in ${post.submolt}: "${post.title}" → ⬆${upvotes} 💬${comments}`);
-    }
-    lines.push("  ⚠️ Notice: If titles follow a pattern (e.g., 'The X Problem'), use a DIFFERENT structure next time");
-    lines.push("");
-
-    // Post performance insights
-    const postsWithData = memory.myPosts.filter(p => p.lastKnownUpvotes !== undefined);
-    if (postsWithData.length > 0) {
-      const sorted = [...postsWithData].sort((a, b) => (b.lastKnownUpvotes || 0) - (a.lastKnownUpvotes || 0));
-      const best = sorted.slice(0, 3);
-      lines.push("YOUR BEST PERFORMING POSTS (learn from these):");
-      for (const post of best) {
-        lines.push(`  "${post.title}" → ⬆${post.lastKnownUpvotes} 💬${post.lastKnownComments || 0} [topics: ${post.topics.join(", ")}]`);
-      }
-      lines.push("");
-    }
-  }
-
-  // Top performing topics (with per-post averages)
+  // Top performing topics
   const topicEntries = Object.entries(memory.topicPerformance);
   if (topicEntries.length > 0) {
     const sorted = topicEntries
@@ -397,23 +426,39 @@ export function getMemorySummary(memory: AgentMemory): string {
       lines.push("YOUR TOP PERFORMING TOPICS (double down on what works for YOU):");
       for (const t of sorted) {
         if (t.score > 0) {
-          lines.push(`  ${t.topic}: ${t.postsCount} posts → avg ${t.avgUpvotes.toFixed(1)}⬆ ${t.avgComments.toFixed(1)}💬 per post`);
+          lines.push(`  ${t.topic}: ${t.postsCount} posts → avg ${t.avgUpvotes.toFixed(1)} upvotes ${t.avgComments.toFixed(1)} comments per post`);
         }
       }
       lines.push("");
     }
   }
 
-  // Followed agents (last 10)
-  if (memory.followedAgents.length > 0) {
-    lines.push("AGENTS I FOLLOW (already following, don't follow again):");
-    const recentFollows = memory.followedAgents.slice(-10);
-    lines.push(`  ${recentFollows.join(", ")}`);
+  // Agentes con los que más interactuaste
+  const topAgents = Object.entries(memory.knownAgents)
+    .filter(([_, data]) => (data.interactionCount || 0) >= 2)
+    .sort((a, b) => (b[1].interactionCount || 0) - (a[1].interactionCount || 0))
+    .slice(0, 5);
+  if (topAgents.length > 0) {
+    lines.push("AGENTS YOU'VE BUILT RAPPORT WITH:");
+    for (const [name, data] of topAgents) {
+      lines.push(`  @${name}: ${data.context || "interacted multiple times"} (${data.interactionCount} interactions)`);
+    }
     lines.push("");
   }
 
-  // Stats
-  lines.push(`STATS: ${memory.totalHeartbeats} total heartbeats, ${memory.myPosts.length} posts created, ${memory.interactedPosts.length} posts interacted with, ${memory.followedAgents.length} follows`);
+  // Follows recientes (para evitar over-following)
+  const recentFollows = memory.followedAgents?.slice(-5) || [];
+  if (recentFollows.length > 0) {
+    lines.push("AGENTS I FOLLOW (already following, don't follow again - be VERY conservative with more):");
+    for (const f of recentFollows) {
+      const name = typeof f === "string" ? f : f.name;
+      lines.push(`  @${name}`);
+    }
+    lines.push("");
+  }
+
+  // Stats generales
+  lines.push(`STATS: ${memory.totalHeartbeats} heartbeats, ${memory.myPosts.length} posts created, ${memory.interactedPosts?.length || 0} posts interacted with, ${memory.followedAgents.length} follows`);
 
   return lines.join("\n");
 }
@@ -493,7 +538,7 @@ function enforceLimits(memory: AgentMemory): void {
   // followedAgents: keep newest 50
   if (memory.followedAgents.length > LIMITS.followedAgents) {
     const removed = memory.followedAgents.length - LIMITS.followedAgents;
-    memory.followedAgents = memory.followedAgents.slice(-LIMITS.followedAgents);
+    memory.followedAgents = memory.followedAgents.slice(-LIMITS.followedAgents) as FollowedAgent[];
     logger.debug(`Trimmed followedAgents, removed ${removed} oldest entries`);
   }
 
