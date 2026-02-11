@@ -31,7 +31,7 @@ export const config = {
 
   // LLM
   llmModel: optionalEnv("LLM_MODEL", "claude-sonnet-4-20250514"),
-  llmMaxTokens: parseInt(optionalEnv("LLM_MAX_TOKENS", "2048")),
+  llmMaxTokens: parseInt(optionalEnv("LLM_MAX_TOKENS", "4096")),
 
   // Logging
   logLevel: optionalEnv("LOG_LEVEL", "info") as "debug" | "info" | "warn" | "error",

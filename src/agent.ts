@@ -799,17 +799,29 @@ async function updateOwnPostsEngagement(memory: AgentMemory): Promise<void> {
 
   logger.debug(`Updating engagement data for ${recentPosts.length} recent posts`);
 
+  const deadPostIds: string[] = [];
+
   for (const post of recentPosts) {
     try {
       const result = await moltbook.getPost(post.id);
       if (result?.post) {
         post.lastKnownUpvotes = result.post.upvotes;
         post.lastKnownComments = result.post.comment_count || 0;
+      } else {
+        // Post returned null (404 or deleted) — mark for removal
+        logger.info(`Post ${post.id} no longer exists, removing from memory`);
+        deadPostIds.push(post.id);
       }
       await randomSleep(400, 800);
     } catch {
       logger.debug(`Failed to fetch engagement for post ${post.id}`);
     }
+  }
+
+  // Remove dead posts from memory
+  if (deadPostIds.length > 0) {
+    memory.myPosts = memory.myPosts.filter(p => !deadPostIds.includes(p.id));
+    logger.info(`Removed ${deadPostIds.length} deleted post(s) from memory`);
   }
 
   // Recalculate topic performance from real engagement data
