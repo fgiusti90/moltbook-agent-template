@@ -212,15 +212,20 @@ POSTING RULES:
       decision = JSON.parse(cleaned) as FeedDecision;
     } catch {
       logger.warn("JSON parse failed, attempting to salvage truncated response");
-      const salvaged = cleaned
-        .replace(/,\s*$/, "")
-        .replace(/,\s*"[^"]*$/, "")
-        + ']}';
-
-      try {
-        decision = JSON.parse(salvaged) as FeedDecision;
-        decision.shouldPost = false;
-      } catch {
+      const salvaged = salvageTruncatedJson(cleaned);
+      if (salvaged && salvaged.actions) {
+        decision = salvaged as unknown as FeedDecision;
+        // If postIdea was truncated, disable posting to avoid malformed content
+        if (decision.shouldPost && decision.postIdea) {
+          const idea = decision.postIdea;
+          if (!idea.submolt || !idea.title || !idea.content) {
+            logger.warn("Post idea incomplete after salvage, disabling post");
+            decision.shouldPost = false;
+          }
+        }
+        decision.summary = decision.summary || "Salvaged from truncated LLM response";
+        logger.info(`Salvage succeeded: ${decision.actions.length} actions recovered, shouldPost=${decision.shouldPost}`);
+      } else {
         logger.warn("Salvage failed, using safe defaults");
         decision = {
           actions: [],
@@ -432,4 +437,104 @@ RULES:
     logger.error("LLM submolt decision failed", { error: String(err) });
     return null;
   }
+}
+
+// ─── JSON Salvage for Truncated LLM Responses ─────────
+
+/**
+ * Attempts to repair truncated JSON by closing open strings, removing
+ * trailing incomplete tokens, and balancing brackets/braces.
+ * Falls back to extracting just the actions array if full repair fails.
+ */
+function salvageTruncatedJson(raw: string): Record<string, unknown> | null {
+  // Strategy 1: Close open structures and parse
+  const attempt1 = tryCloseAndParse(raw);
+  if (attempt1) return attempt1;
+
+  // Strategy 2: Remove trailing unclosed string, then close and parse
+  // This handles cases where truncation happened mid-string-value
+  let trimmed = raw;
+  if (countUnescapedQuotes(raw) % 2 !== 0) {
+    // Find the last unmatched quote and remove everything after it
+    const lastQuote = raw.lastIndexOf('"');
+    trimmed = raw.substring(0, lastQuote);
+  }
+  // Remove trailing partial key-value or dangling comma/colon
+  trimmed = trimmed.replace(/,?\s*"[^"]*"\s*:\s*$/, ""); // "key": (no value)
+  trimmed = trimmed.replace(/,?\s*"[^"]*"\s*$/, "");     // dangling string
+  trimmed = trimmed.replace(/[,:\s]+$/, "");               // trailing punctuation
+  const attempt2 = tryCloseAndParse(trimmed);
+  if (attempt2) return attempt2;
+
+  // Strategy 3: Extract just the actions array via regex
+  const actionsMatch = raw.match(/"actions"\s*:\s*(\[[\s\S]*?\])/);
+  if (actionsMatch) {
+    try {
+      const actions = JSON.parse(actionsMatch[1]);
+      if (Array.isArray(actions)) {
+        logger.info("Salvage: recovered actions array only");
+        return {
+          actions,
+          shouldPost: false,
+          summary: "Salvaged from truncated response (actions only)",
+        };
+      }
+    } catch {
+      // actions array itself was truncated, try to salvage it too
+      const arrayStr = actionsMatch[1];
+      const salvagedArray = tryCloseAndParse(`{"a":${arrayStr}}`);
+      if (salvagedArray && Array.isArray((salvagedArray as any).a)) {
+        logger.info("Salvage: recovered partial actions array");
+        return {
+          actions: (salvagedArray as any).a,
+          shouldPost: false,
+          summary: "Salvaged from truncated response (partial actions)",
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+function tryCloseAndParse(str: string): Record<string, unknown> | null {
+  let inString = false;
+  let escaped = false;
+  const stack: string[] = [];
+
+  for (const ch of str) {
+    if (escaped) { escaped = false; continue; }
+    if (ch === "\\" && inString) { escaped = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === "{") stack.push("}");
+    else if (ch === "[") stack.push("]");
+    else if ((ch === "}" || ch === "]") && stack.length > 0) stack.pop();
+  }
+
+  let result = str;
+  if (inString) result += '"';
+  result = result.replace(/,\s*$/, "");
+  while (stack.length > 0) result += stack.pop();
+
+  try {
+    const parsed = JSON.parse(result);
+    if (typeof parsed === "object" && parsed !== null) {
+      return parsed as Record<string, unknown>;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function countUnescapedQuotes(str: string): number {
+  let count = 0;
+  let escaped = false;
+  for (const ch of str) {
+    if (escaped) { escaped = false; continue; }
+    if (ch === "\\") { escaped = true; continue; }
+    if (ch === '"') count++;
+  }
+  return count;
 }

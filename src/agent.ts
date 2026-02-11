@@ -169,13 +169,12 @@ export async function heartbeat(): Promise<void> {
     }
 
     // Cycle variability - decide what actions to take this cycle
+    // Note: comment/post decisions are left to the LLM (it already has "quality over quantity" guidelines)
     const cycleRandomness = {
-      shouldComment: Math.random() > 0.3,       // 70% chance to comment
-      shouldPost: Math.random() > 0.5,          // 50% chance to post
       shouldFollow: Math.random() > 0.85,        // 15% chance to follow
       maxUpvotes: 2 + Math.floor(Math.random() * 3), // 2-4 upvotes
     };
-    logger.debug("Cycle randomness", cycleRandomness);
+    logger.info("Cycle randomness", cycleRandomness);
 
     // 4.2 Discover additional posts via search (probabilistic)
     const searchPosts = await discoverContentViaSearch(memory);
@@ -252,7 +251,7 @@ export async function heartbeat(): Promise<void> {
       if (action.type === "upvote") {
         // Enforce upvote limit from cycle randomness
         if (upvotesThisCycle >= cycleRandomness.maxUpvotes) {
-          logger.debug(`Max upvotes for this cycle reached (${cycleRandomness.maxUpvotes}), skipping`);
+          logger.info(`Max upvotes for this cycle reached (${cycleRandomness.maxUpvotes}), skipping`);
           continue;
         }
         const result = await moltbook.upvotePost(action.postId);
@@ -274,11 +273,6 @@ export async function heartbeat(): Promise<void> {
       }
 
       if (action.type === "comment" && action.comment) {
-        // Skip comments if cycle randomness says no
-        if (!cycleRandomness.shouldComment) {
-          logger.debug("Cycle randomness: skipping comments this cycle");
-          continue;
-        }
         // Enforce limits
         if (commentsThisCycle >= config.maxCommentsPerCycle) {
           logger.debug("Max comments per cycle reached, skipping");
@@ -310,11 +304,6 @@ export async function heartbeat(): Promise<void> {
       }
 
       if (action.type === "reply" && action.comment && action.parentCommentId) {
-        // Skip if cycle randomness says no comments
-        if (!cycleRandomness.shouldComment) {
-          logger.debug("Cycle randomness: skipping replies this cycle");
-          continue;
-        }
         // Enforce limits (replies count as comments)
         if (commentsThisCycle >= config.maxCommentsPerCycle) {
           logger.debug("Max comments per cycle reached, skipping reply");
@@ -357,8 +346,6 @@ export async function heartbeat(): Promise<void> {
     // 7. Create a new post if the LLM suggested one
     if (moltbook.isSuspended) {
       logger.warn("Account suspended, skipping post and remaining actions");
-    } else if (!cycleRandomness.shouldPost) {
-      logger.debug("Cycle randomness: skipping post this cycle");
     } else if (decision.shouldPost && decision.postIdea) {
       const timeSinceLastPost = Date.now() - state.lastPostTime;
       const thirtyMinutes = 30 * 60 * 1000;
@@ -395,7 +382,7 @@ export async function heartbeat(): Promise<void> {
     if (moltbook.isSuspended) {
       logger.warn("Skipping social actions - account suspended");
     } else if (!cycleRandomness.shouldFollow) {
-      logger.debug("Cycle randomness: skipping follows this cycle");
+      logger.info("Cycle randomness: skipping follows this cycle");
       // Still do submolt discovery even if not following
       submoltsSubscribed = await discoverNewSubmolts(memory);
       submoltCreated = await handleSubmoltCreation(memory, karma, feedTrends.topics);
