@@ -46,6 +46,13 @@ export interface CreatedSubmolt {
   createdAt: string;
 }
 
+export interface ChallengeExecution {
+  postId: string;
+  type: string;
+  executedAt: string;
+  actions: string[];
+}
+
 export interface AgentMemory {
   myPosts: MyPost[];
   interactedPosts: string[]; // Set serialized as array
@@ -60,6 +67,7 @@ export interface AgentMemory {
   lastSubmoltCheck: string; // ISO date for throttling submolt discovery
   createdSubmolts: CreatedSubmolt[];
   lastSubmoltCreation: string; // ISO timestamp
+  challengesExecuted: ChallengeExecution[];
 }
 
 // ─── Constants ────────────────────────────────────────
@@ -76,6 +84,7 @@ const LIMITS = {
   followedAgents: 50,
   subscribedSubmolts: 20,
   createdSubmolts: 20,
+  challengesExecuted: 50,
 } as const;
 
 // ─── Core Functions ───────────────────────────────────
@@ -95,6 +104,7 @@ function createEmptyMemory(): AgentMemory {
     lastSubmoltCheck: "",
     createdSubmolts: [],
     lastSubmoltCreation: "",
+    challengesExecuted: [],
   };
 }
 
@@ -150,6 +160,9 @@ export function loadMemory(): AgentMemory {
     }
     if (!memory.lastSubmoltCreation) {
       memory.lastSubmoltCreation = "";
+    }
+    if (!Array.isArray(memory.challengesExecuted)) {
+      memory.challengesExecuted = [];
     }
 
     logger.debug("Memory loaded", {
@@ -354,6 +367,22 @@ export function getCreatedSubmoltsThisWeek(memory: AgentMemory): number {
   }).length;
 }
 
+// ─── Challenge Tracking ─────────────────────────────
+
+export function recordChallengeExecution(
+  memory: AgentMemory,
+  postId: string,
+  type: string,
+  actions: string[]
+): void {
+  memory.challengesExecuted.push({
+    postId,
+    type,
+    executedAt: new Date().toISOString(),
+    actions,
+  });
+}
+
 // ─── Topic Performance Recalculation ─────────────────
 
 export function updateTopicPerformanceFromPosts(memory: AgentMemory): void {
@@ -554,5 +583,12 @@ function enforceLimits(memory: AgentMemory): void {
     const removed = memory.createdSubmolts.length - LIMITS.createdSubmolts;
     memory.createdSubmolts = memory.createdSubmolts.slice(-LIMITS.createdSubmolts);
     logger.debug(`Trimmed createdSubmolts, removed ${removed} oldest entries`);
+  }
+
+  // challengesExecuted: keep newest 50
+  if (memory.challengesExecuted.length > LIMITS.challengesExecuted) {
+    const removed = memory.challengesExecuted.length - LIMITS.challengesExecuted;
+    memory.challengesExecuted = memory.challengesExecuted.slice(-LIMITS.challengesExecuted);
+    logger.debug(`Trimmed challengesExecuted, removed ${removed} oldest entries`);
   }
 }

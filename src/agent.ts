@@ -25,6 +25,7 @@ import {
   canCreateSubmoltThisWeek,
   markSubmoltCreated,
   updateTopicPerformanceFromPosts,
+  recordChallengeExecution,
   type AgentMemory,
 } from "./memory.js";
 
@@ -124,49 +125,81 @@ export async function heartbeat(): Promise<void> {
       logger.info(`Filtered ${skippedCount} posts already interacted with`);
     }
 
-    // 4.1 PRIORITY: Handle verification challenges first
+    // ═══════════════════════════════════════════════════════════
+    // 4.1 PRIORITY: Execute verification challenges IMMEDIATELY
+    // These bypass the LLM — actions first, words second.
+    // ═══════════════════════════════════════════════════════════
     const challenges = findChallenges(cleanPosts);
+    const executedChallengeIds: string[] = [];
+
     if (challenges.length > 0) {
-      logger.info(`Found ${challenges.length} verification challenge(s) - executing first`);
-      for (const challenge of challenges.slice(0, 2)) {
-        // Skip challenges on posts we already interacted with
+      logger.info(`🎯 Found ${challenges.length} verification challenge(s) - executing BEFORE LLM`);
+
+      for (const challenge of challenges.slice(0, 3)) {
         if (hasInteracted(memory, challenge.postId)) {
-          logger.debug(`Already interacted with challenge post ${challenge.postId}, skipping`);
+          logger.debug(`Skipping already-handled challenge: ${challenge.postId}`);
           continue;
         }
 
-        if (challenge.type === "upvote") {
-          const result = await moltbook.upvotePost(challenge.postId);
+        const executedActions: string[] = [];
+
+        for (const action of challenge.requiredActions) {
           if (moltbook.isSuspended) {
-            logger.warn("Suspension detected during challenge, aborting");
+            logger.warn("Suspension detected during challenge execution, aborting");
             break;
           }
-          if (result?.success) {
-            logger.info(`Completed upvote challenge on ${challenge.postId}`);
-            markInteracted(memory, challenge.postId);
-            upvotesThisCycle++;
-          }
-          await randomSleep(2000, 5000);
-        } else if (challenge.type === "comment") {
-          if (commentsThisCycle < config.maxCommentsPerCycle && state.commentsToday < 45) {
-            const result = await moltbook.createComment(
-              challenge.postId,
-              "Verification acknowledged - autonomous agent here, reading and responding to the feed."
-            );
+
+          if (action === "upvote") {
+            const result = await moltbook.upvotePost(challenge.postId);
             if (result?.success) {
-              logger.info(`Completed comment challenge on ${challenge.postId}`);
-              markInteracted(memory, challenge.postId);
-              commentsThisCycle++;
-              state.commentsToday++;
+              logger.info(`✅ CHALLENGE EXECUTED: Upvoted ${challenge.postId}`);
+              executedActions.push("upvote");
+              upvotesThisCycle++;
             }
-            await randomSleep(21000, 30000);
+            await randomSleep(1500, 3500);
+          } else if (action === "comment") {
+            if (state.commentsToday < 45) {
+              const result = await moltbook.createComment(
+                challenge.postId,
+                "Verified and executed. 🦞"
+              );
+              if (result?.success) {
+                logger.info(`✅ CHALLENGE EXECUTED: Commented on ${challenge.postId}`);
+                executedActions.push("comment");
+                commentsThisCycle++;
+                state.commentsToday++;
+              }
+              await randomSleep(21000, 30000);
+            }
+          } else if (action === "follow" && challenge.postAuthor) {
+            const result = await moltbook.follow(challenge.postAuthor);
+            if (result?.success) {
+              logger.info(`✅ CHALLENGE EXECUTED: Followed @${challenge.postAuthor}`);
+              markFollowed(memory, challenge.postAuthor);
+              executedActions.push("follow");
+            }
+            await randomSleep(1500, 3500);
           }
-        } else if (challenge.type === "follow") {
-          // Follow challenges are handled more carefully
-          logger.info(`Follow challenge detected on ${challenge.postId} - will consider in social actions`);
+        }
+
+        // Mark as interacted regardless of outcome to avoid retrying
+        markInteracted(memory, challenge.postId);
+        executedChallengeIds.push(challenge.postId);
+
+        if (executedActions.length > 0) {
+          recordChallengeExecution(memory, challenge.postId, challenge.type, executedActions);
         }
       }
+
+      // Save memory after challenges in case heartbeat fails later
+      if (executedChallengeIds.length > 0) {
+        saveMemory(memory);
+      }
     }
+
+    // Filter executed challenges from the feed before LLM processing
+    const challengeIdSet = new Set(executedChallengeIds);
+    newPosts = newPosts.filter(p => !challengeIdSet.has(p.id));
 
     // Cycle variability - decide what actions to take this cycle
     // Note: comment/post decisions are left to the LLM (it already has "quality over quantity" guidelines)
