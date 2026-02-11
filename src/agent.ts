@@ -300,13 +300,15 @@ export async function heartbeat(): Promise<boolean> {
           break;
         }
         if (result?.success) {
-          logger.info(`Upvoted post ${action.postId}: ${action.reason}`);
+          logger.info(`👍 Upvoted post ${action.postId}: ${action.reason}`);
           markInteracted(memory, action.postId);
           upvotesThisCycle++;
           // Track agent interaction
           if (post) {
             updateAgent(memory, post.author.name, `Upvoted their post: "${post.title.substring(0, 50)}"`, "positive");
           }
+        } else {
+          logger.warn(`❌ Upvote FAILED on ${action.postId}`, { result });
         }
         // Random delay between upvotes
         await randomSleep(1500, 4000);
@@ -330,7 +332,7 @@ export async function heartbeat(): Promise<boolean> {
           break;
         }
         if (result?.success) {
-          logger.info(`Commented on ${action.postId}: "${action.comment.substring(0, 80)}..."`);
+          logger.info(`💬 Commented on ${action.postId}: "${action.comment.substring(0, 80)}..."`);
           markInteracted(memory, action.postId);
           commentsThisCycle++;
           state.commentsToday++;
@@ -338,6 +340,8 @@ export async function heartbeat(): Promise<boolean> {
           if (post) {
             updateAgent(memory, post.author.name, `Commented on: "${post.title.substring(0, 50)}"`, "positive");
           }
+        } else {
+          logger.warn(`❌ Comment FAILED on ${action.postId}`, { result });
         }
         // Respect 20s cooldown + random jitter
         await randomSleep(21000, 35000);
@@ -368,7 +372,7 @@ export async function heartbeat(): Promise<boolean> {
 
         const result = await moltbook.createComment(action.postId, action.comment, action.parentCommentId);
         if (result?.success) {
-          logger.info(`Replied to comment ${action.parentCommentId}: "${action.comment.substring(0, 80)}..."`);
+          logger.info(`💬 Replied to comment ${action.parentCommentId}: "${action.comment.substring(0, 80)}..."`);
           markCommentReplied(memory, action.parentCommentId);
           markInteracted(memory, action.postId);
           commentsThisCycle++;
@@ -377,6 +381,8 @@ export async function heartbeat(): Promise<boolean> {
           if (post) {
             updateAgent(memory, post.author.name, `Replied to comment on: "${post.title.substring(0, 50)}"`, "positive");
           }
+        } else {
+          logger.warn(`❌ Reply FAILED on comment ${action.parentCommentId}`, { result });
         }
         // Respect 20s cooldown + random jitter
         await randomSleep(21000, 35000);
@@ -411,6 +417,8 @@ export async function heartbeat(): Promise<boolean> {
             submolt,
             content,
           });
+        } else {
+          logger.warn(`❌ Post FAILED: "${title}" in m/${submolt}`, { result });
         }
       }
     }
