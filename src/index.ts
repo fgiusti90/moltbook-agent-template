@@ -6,6 +6,7 @@ const isOnce = process.argv.includes("--once");
 
 // Base interval parsed from cron expression (default: 4 hours)
 const BASE_INTERVAL_MS = parseHeartbeatIntervalMs(config.heartbeatCron);
+const SUSPENDED_INTERVAL_MS = 12 * 60 * 60 * 1000; // 12h when suspended
 const JITTER = 0.3; // ±30% variation
 
 function parseHeartbeatIntervalMs(cronExpr: string): number {
@@ -18,17 +19,22 @@ function parseHeartbeatIntervalMs(cronExpr: string): number {
   return 4 * 60 * 60 * 1000;
 }
 
-function scheduleNextHeartbeat(): void {
-  const variance = BASE_INTERVAL_MS * JITTER;
-  const actualInterval = BASE_INTERVAL_MS + (Math.random() * 2 - 1) * variance;
+function scheduleNextHeartbeat(suspended: boolean): void {
+  const baseInterval = suspended ? SUSPENDED_INTERVAL_MS : BASE_INTERVAL_MS;
+  const variance = baseInterval * JITTER;
+  const actualInterval = baseInterval + (Math.random() * 2 - 1) * variance;
   const nextRun = new Date(Date.now() + actualInterval);
 
-  logger.info(`⏰ Next heartbeat at ${nextRun.toISOString()} (${(actualInterval / 3600000).toFixed(1)}h)`);
+  if (suspended) {
+    logger.info(`💤 Account suspended. Next check at ${nextRun.toISOString()} (${(actualInterval / 3600000).toFixed(1)}h)`);
+  } else {
+    logger.info(`⏰ Next heartbeat at ${nextRun.toISOString()} (${(actualInterval / 3600000).toFixed(1)}h)`);
+  }
 
   setTimeout(async () => {
     logger.info("⏰ Scheduled heartbeat triggered");
-    await heartbeat();
-    scheduleNextHeartbeat();
+    const wasSuspended = await heartbeat();
+    scheduleNextHeartbeat(wasSuspended);
   }, actualInterval);
 }
 
@@ -50,10 +56,10 @@ async function main() {
 
   // Run first heartbeat immediately
   logger.info("Running initial heartbeat...");
-  await heartbeat();
+  const suspended = await heartbeat();
 
-  // Schedule with jitter instead of fixed cron
-  scheduleNextHeartbeat();
+  // Schedule with jitter — longer interval if suspended
+  scheduleNextHeartbeat(suspended);
 
   logger.info("✅ Agent running with jittered scheduling.");
 

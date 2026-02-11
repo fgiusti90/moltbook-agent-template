@@ -59,7 +59,7 @@ function resetDailyCountersIfNeeded() {
 
 // ─── Heartbeat ────────────────────────────────────────
 
-export async function heartbeat(): Promise<void> {
+export async function heartbeat(): Promise<boolean> {
   const startTime = Date.now();
   logger.info("🦞 Heartbeat started");
 
@@ -72,22 +72,12 @@ export async function heartbeat(): Promise<void> {
   let postsThisCycle = 0;
 
   try {
-    // 0. Update engagement data for our recent posts (learn what works)
-    await updateOwnPostsEngagement(memory);
-
-    // 1. Check agent status
-    const status = await moltbook.getStatus();
-    if (!status) {
-      logger.error("Could not reach Moltbook API");
-      return;
+    // 0. Check suspension FIRST — avoid any unnecessary API calls
+    if (moltbook.isSuspended) {
+      logger.warn(`🚫 Account still suspended (cached). Skipping heartbeat.`);
+      return true; // suspended
     }
 
-    if (status.status === "pending_claim") {
-      logger.warn("Agent is still pending claim! Ask your human to verify via tweet.");
-      return;
-    }
-
-    // 2. Get agent profile for karma info (also detects suspension)
     const me = await moltbook.getMe();
     if (!me && moltbook.isSuspended) {
       logger.warn(`🚫 Account is suspended. Skipping heartbeat. Reason: ${moltbook.suspensionReason}`);
@@ -97,9 +87,26 @@ export async function heartbeat(): Promise<void> {
         upvotesGiven: 0,
       });
       saveMemory(memory);
-      return;
+      return true; // suspended
     }
-    const karma = me?.agent?.karma || 0;
+
+    if (!me) {
+      logger.error("Could not reach Moltbook API");
+      return false;
+    }
+
+    const karma = me.agent?.karma || 0;
+
+    // 0.5. Update engagement data for our recent posts (learn what works)
+    await updateOwnPostsEngagement(memory);
+
+    // 1. Check agent status
+    const status = await moltbook.getStatus();
+
+    if (status?.status === "pending_claim") {
+      logger.warn("Agent is still pending claim! Ask your human to verify via tweet.");
+      return false;
+    }
 
     // 3. Fetch and sanitize the feed
     logger.info("Fetching feed...");
@@ -107,7 +114,7 @@ export async function heartbeat(): Promise<void> {
 
     if (!feedResult?.posts?.length) {
       logger.info("Feed is empty or unavailable");
-      return;
+      return false;
     }
 
     const safePosts = feedResult.posts.map(p => ({
@@ -238,7 +245,7 @@ export async function heartbeat(): Promise<void> {
 
     if (!decision) {
       logger.warn("LLM returned no decision, skipping this cycle");
-      return;
+      return false;
     }
 
     logger.info(`LLM decision: ${decision.summary}`);
@@ -254,7 +261,7 @@ export async function heartbeat(): Promise<void> {
       saveMemory(memory);
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
       logger.info(`✅ Heartbeat complete in ${elapsed}s | SUSPENDED - no actions taken`);
-      return;
+      return true; // suspended
     }
 
     // 6. Validate and execute actions
@@ -453,8 +460,10 @@ export async function heartbeat(): Promise<void> {
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
     state.lastHeartbeat = Date.now();
     logger.info(`✅ Heartbeat complete in ${elapsed}s | Posts today: ${state.postsToday} | Comments today: ${state.commentsToday}`);
+    return false; // not suspended
   } catch (err) {
     logger.error("Heartbeat failed", { error: String(err) });
+    return false;
   }
 }
 
