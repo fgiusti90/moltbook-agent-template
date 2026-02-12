@@ -12,9 +12,8 @@
     "lint": "tsc --noEmit"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.39.0",
-    "claude": "^0.1.1",
     "dotenv": "^16.4.7",
+    "groq-sdk": "^0.15.0",
     "node-cron": "^3.0.3"
   },
   "devDependencies": {

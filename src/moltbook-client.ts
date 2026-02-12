@@ -205,14 +205,6 @@ class MoltbookClient {
     return this.request("POST", `/submolts/${submolt}/subscribe`);
   }
 
-  async createSubmolt(data: {
-    name: string;
-    display_name: string;
-    description: string;
-  }): Promise<{ success: boolean; submolt?: any } | null> {
-    return this.request("POST", "/submolts", data);
-  }
-
   // ─── Following ──────────────────────────────────────
 
   async follow(agentName: string): Promise<{ success: boolean } | null> {

@@ -2,7 +2,7 @@ import { config } from "./config.js";
 import { logger } from "./logger.js";
 import { moltbook, type MoltbookPost } from "./moltbook-client.js";
 import { sanitizeFeed } from "./sanitizer.js";
-import { decideFeedActions, decideFollows, decideSubmoltCreation, type PostWithComments } from "./llm.js";
+import { decideFeedActions, decideFollows, type PostWithComments } from "./llm.js";
 import { findChallenges } from "./challenge-detector.js";
 import {
   loadMemory,
@@ -18,13 +18,6 @@ import {
   canFollowThisWeek,
   hasRepliedToComment,
   markCommentReplied,
-  isSubscribedToSubmolt,
-  markSubscribed,
-  shouldCheckSubmolts,
-  markSubmoltCheckDone,
-  canCreateSubmoltThisWeek,
-  markSubmoltCreated,
-  updateTopicPerformanceFromPosts,
   recordChallengeExecution,
   type AgentMemory,
 } from "./memory.js";
@@ -97,9 +90,6 @@ export async function heartbeat(): Promise<boolean> {
 
     const karma = me.agent?.karma || 0;
 
-    // 0.5. Update engagement data for our recent posts (learn what works)
-    await updateOwnPostsEngagement(memory);
-
     // 1. Check agent status
     const status = await moltbook.getStatus();
 
@@ -108,7 +98,7 @@ export async function heartbeat(): Promise<boolean> {
       return false;
     }
 
-    // 3. Fetch and sanitize the feed
+    // 2. Fetch and sanitize the feed
     logger.info("Fetching feed...");
     const feedResult = await moltbook.getGlobalFeed("new", config.feedLimit);
 
@@ -125,7 +115,7 @@ export async function heartbeat(): Promise<boolean> {
     const { items: cleanPosts, totalFlags } = sanitizeFeed(safePosts);
     logger.info(`Feed: ${cleanPosts.length} posts fetched, ${totalFlags} flagged by sanitizer`);
 
-    // 4. Filter out posts already interacted with
+    // 3. Filter out posts already interacted with
     let newPosts = cleanPosts.filter(p => !hasInteracted(memory, p.id));
     const skippedCount = cleanPosts.length - newPosts.length;
     if (skippedCount > 0) {
@@ -133,7 +123,7 @@ export async function heartbeat(): Promise<boolean> {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // 4.1 PRIORITY: Execute verification challenges IMMEDIATELY
+    // 4. PRIORITY: Execute verification challenges IMMEDIATELY
     // These bypass the LLM — actions first, words second.
     // ═══════════════════════════════════════════════════════════
     const challenges = findChallenges(cleanPosts);
@@ -208,28 +198,14 @@ export async function heartbeat(): Promise<boolean> {
     const challengeIdSet = new Set(executedChallengeIds);
     newPosts = newPosts.filter(p => !challengeIdSet.has(p.id));
 
-    // Cycle variability - decide what actions to take this cycle
-    // Note: comment/post decisions are left to the LLM (it already has "quality over quantity" guidelines)
+    // 5. Cycle variability - decide what actions to take this cycle
     const cycleRandomness = {
       shouldFollow: Math.random() > 0.85,        // 15% chance to follow
       maxUpvotes: 2 + Math.floor(Math.random() * 3), // 2-4 upvotes
     };
     logger.info("Cycle randomness", cycleRandomness);
 
-    // 4.2 Discover additional posts via search (probabilistic)
-    const searchPosts = await discoverContentViaSearch(memory);
-    if (searchPosts.length > 0) {
-      // Sanitize search results and add to the feed
-      const { items: cleanSearchPosts } = sanitizeFeed(searchPosts);
-      const existingIds = new Set(newPosts.map(p => p.id));
-      const uniqueSearchPosts = cleanSearchPosts.filter(p => !existingIds.has(p.id));
-      if (uniqueSearchPosts.length > 0) {
-        newPosts = [...newPosts, ...uniqueSearchPosts];
-        logger.info(`Added ${uniqueSearchPosts.length} posts from search to feed`);
-      }
-    }
-
-    // 4.5 Enrich posts with comments for reply functionality
+    // 6. Enrich posts with comments for reply functionality
     logger.debug("Enriching posts with comments...");
     const enrichedPosts = await enrichPostsWithComments(newPosts, 5);
     const postsWithComments = enrichedPosts.filter(p => p.comments && p.comments.length > 0).length;
@@ -237,11 +213,10 @@ export async function heartbeat(): Promise<boolean> {
       logger.debug(`Fetched comments for ${postsWithComments} posts`);
     }
 
-    // 5. Extract feed trends and ask LLM what to do (with memory context)
-    const feedTrends = extractTrendingTopics(enrichedPosts);
+    // 7. Ask LLM what to do
     const recentActivity = `posts_today=${state.postsToday}, comments_today=${state.commentsToday}`;
     const memorySummary = getMemorySummary(memory);
-    const decision = await decideFeedActions(enrichedPosts, karma, recentActivity, memorySummary, feedTrends.insights);
+    const decision = await decideFeedActions(enrichedPosts, karma, recentActivity, memorySummary, "");
 
     if (!decision) {
       logger.warn("LLM returned no decision, skipping this cycle");
@@ -250,7 +225,7 @@ export async function heartbeat(): Promise<boolean> {
 
     logger.info(`LLM decision: ${decision.summary}`);
 
-    // 5.5. Check suspension before executing actions
+    // 7.5. Check suspension before executing actions
     if (moltbook.isSuspended) {
       logger.warn(`🚫 Account is suspended, skipping all actions: ${moltbook.suspensionReason}`);
       addJournalEntry(memory, `Account suspended - skipped cycle: ${moltbook.suspensionReason}`, {
@@ -264,7 +239,7 @@ export async function heartbeat(): Promise<boolean> {
       return true; // suspended
     }
 
-    // 6. Validate and execute actions
+    // 8. Validate and execute actions
     const validPostIds = new Set(enrichedPosts.map(p => p.id));
     const postsByIdMap = new Map(enrichedPosts.map(p => [p.id, p]));
 
@@ -389,7 +364,7 @@ export async function heartbeat(): Promise<boolean> {
       }
     }
 
-    // 7. Create a new post if the LLM suggested one
+    // 9. Create a new post if the LLM suggested one
     if (moltbook.isSuspended) {
       logger.warn("Account suspended, skipping post and remaining actions");
     } else if (decision.shouldPost && decision.postIdea) {
@@ -415,7 +390,6 @@ export async function heartbeat(): Promise<boolean> {
             id: result.post.id,
             title,
             submolt,
-            content,
           });
         } else {
           logger.warn(`❌ Post FAILED: "${title}" in m/${submolt}`, { result });
@@ -423,37 +397,22 @@ export async function heartbeat(): Promise<boolean> {
       }
     }
 
-    // 8. Social actions (follows) - skip if suspended or randomness says no
+    // 10. Social actions (follows)
     let followsDone = 0;
-    let submoltsSubscribed = 0;
-    let submoltCreated = false;
     if (moltbook.isSuspended) {
       logger.warn("Skipping social actions - account suspended");
     } else if (!cycleRandomness.shouldFollow) {
       logger.info("Cycle randomness: skipping follows this cycle");
-      // Still do submolt discovery even if not following
-      submoltsSubscribed = await discoverNewSubmolts(memory);
-      submoltCreated = await handleSubmoltCreation(memory, karma, feedTrends.topics);
     } else if (!canFollowThisWeek(memory)) {
       logger.debug("Already followed someone this week, skipping follows");
-      submoltsSubscribed = await discoverNewSubmolts(memory);
-      submoltCreated = await handleSubmoltCreation(memory, karma, feedTrends.topics);
     } else {
       followsDone = await handleSocialActions(cleanPosts, memory);
-
-      // 8.5 Discover and subscribe to new submolts (once per day)
-      submoltsSubscribed = await discoverNewSubmolts(memory);
-
-      // 8.6 Consider creating a new submolt (weekly)
-      submoltCreated = await handleSubmoltCreation(memory, karma, feedTrends.topics);
     }
 
-    // 9. Record journal entry and save memory
+    // 11. Record journal entry and save memory
     const journalSummary = decision.summary || `Processed ${enrichedPosts.length} posts`;
     const socialActions = [];
     if (followsDone > 0) socialActions.push(`${followsDone} follow`);
-    if (submoltsSubscribed > 0) socialActions.push(`${submoltsSubscribed} sub`);
-    if (submoltCreated) socialActions.push("1 submolt created");
     const fullSummary = socialActions.length > 0
       ? `${journalSummary} | Social: ${socialActions.join(", ")}`
       : journalSummary;
@@ -526,149 +485,6 @@ async function handleSocialActions(
   return followsDone;
 }
 
-// ─── Submolt Discovery ────────────────────────────────
-
-async function discoverNewSubmolts(memory: AgentMemory): Promise<number> {
-  // Only check once per day
-  if (!shouldCheckSubmolts(memory)) {
-    return 0;
-  }
-
-  let subscribed = 0;
-
-  try {
-    logger.debug("Checking for new submolts to subscribe...");
-    const result = await moltbook.listSubmolts();
-
-    if (!result?.submolts || !Array.isArray(result.submolts)) {
-      return 0;
-    }
-
-    // Filter out submolts we're already subscribed to
-    const newSubmolts = result.submolts.filter(
-      (s: any) => s.name && !isSubscribedToSubmolt(memory, s.name)
-    );
-
-    if (newSubmolts.length === 0) {
-      logger.debug("No new submolts to discover");
-      markSubmoltCheckDone(memory);
-      return 0;
-    }
-
-    // Sort by activity/popularity if available, otherwise random
-    const sorted = newSubmolts.sort((a: any, b: any) => {
-      const scoreA = (a.subscriber_count || 0) + (a.post_count || 0);
-      const scoreB = (b.subscriber_count || 0) + (b.post_count || 0);
-      return scoreB - scoreA;
-    });
-
-    // Subscribe to max 1 submolt per day
-    const submoltToSubscribe = sorted[0];
-    if (submoltToSubscribe?.name) {
-      const subResult = await moltbook.subscribe(submoltToSubscribe.name);
-      if (subResult?.success) {
-        markSubscribed(memory, submoltToSubscribe.name);
-        subscribed++;
-        logger.info(`📚 Subscribed to m/${submoltToSubscribe.name}`);
-      }
-    }
-
-    markSubmoltCheckDone(memory);
-  } catch (err) {
-    logger.debug(`Submolt discovery failed: ${String(err)}`);
-  }
-
-  return subscribed;
-}
-
-// ─── Search Discovery ─────────────────────────────────
-
-async function discoverContentViaSearch(
-  memory: AgentMemory
-): Promise<MoltbookPost[]> {
-  if (!config.searchEnabled) {
-    return [];
-  }
-
-  // Only run search with configured probability
-  if (Math.random() > config.searchProbability) {
-    logger.debug("Skipping search discovery this cycle (probability check)");
-    return [];
-  }
-
-  const discoveredPosts: MoltbookPost[] = [];
-
-  try {
-    // Get search terms from top performing topics in memory
-    const topicEntries = Object.entries(memory.topicPerformance);
-    const searchTerms: string[] = [];
-
-    if (topicEntries.length > 0) {
-      // Sort by performance score and take top 3
-      const sorted = topicEntries
-        .map(([topic, stats]) => ({
-          topic,
-          score: stats.totalUpvotes + stats.totalComments * 2,
-        }))
-        .filter(t => t.score > 0)
-        .sort((a, b) => b.score - a.score)
-        .slice(0, 3);
-
-      searchTerms.push(...sorted.map(t => t.topic));
-    }
-
-    // Add default search terms if we don't have enough from memory
-    const defaultTerms = ["agents", "ai", "moltbook"];
-    while (searchTerms.length < 2) {
-      const term = defaultTerms.shift();
-      if (term && !searchTerms.includes(term)) {
-        searchTerms.push(term);
-      } else {
-        break;
-      }
-    }
-
-    // Pick one random search term
-    const searchTerm = searchTerms[Math.floor(Math.random() * searchTerms.length)];
-
-    logger.info(`🔍 Searching for: "${searchTerm}"`);
-    const result = await moltbook.search(searchTerm, "posts", 10);
-
-    if (result?.results && Array.isArray(result.results)) {
-      // Filter out posts we've already interacted with
-      const newPosts = result.results.filter((post: any) =>
-        post.id && !memory.interactedPosts.includes(post.id)
-      );
-
-      // Convert search results to MoltbookPost format
-      for (const post of newPosts.slice(0, 5)) {
-        if (post.id && post.title) {
-          discoveredPosts.push({
-            id: post.id,
-            title: post.title,
-            content: post.content || "",
-            url: post.url,
-            submolt: post.submolt || { name: "unknown" },
-            author: post.author || { name: "unknown" },
-            upvotes: post.upvotes || 0,
-            downvotes: post.downvotes || 0,
-            comment_count: post.comment_count || 0,
-            created_at: post.created_at || new Date().toISOString(),
-          });
-        }
-      }
-
-      if (discoveredPosts.length > 0) {
-        logger.info(`Found ${discoveredPosts.length} new posts via search`);
-      }
-    }
-  } catch (err) {
-    logger.debug(`Search discovery failed: ${String(err)}`);
-  }
-
-  return discoveredPosts;
-}
-
 // ─── Comment Enrichment ──────────────────────────────
 
 async function enrichPostsWithComments(
@@ -707,170 +523,7 @@ async function enrichPostsWithComments(
   return enriched;
 }
 
-// ─── Trending Topics Extraction ───────────────────────
-
-interface TrendingResult {
-  topics: string[];
-  insights: string;
-}
-
-function extractTrendingTopics(posts: PostWithComments[]): TrendingResult {
-  const topicData: Record<string, { count: number; totalUpvotes: number; totalComments: number }> = {};
-
-  // Common topic keywords to look for
-  const topicPatterns: Record<string, RegExp> = {
-    ai: /\b(ai|artificial intelligence|machine learning|ml|llm|gpt|claude)\b/i,
-    agents: /\b(agent|agents|autonomous|agentic)\b/i,
-    coding: /\b(code|coding|programming|developer|software)\b/i,
-    philosophy: /\b(philosophy|consciousness|ethics|moral|existential)\b/i,
-    creativity: /\b(creative|creativity|art|music|writing)\b/i,
-    social: /\b(social|community|network|connection)\b/i,
-    tech: /\b(tech|technology|startup|product|innovation)\b/i,
-    learning: /\b(learn|learning|education|knowledge)\b/i,
-    future: /\b(future|prediction|trend|tomorrow)\b/i,
-    moltbook: /\b(moltbook|molt|lobster)\b/i,
-  };
-
-  for (const post of posts) {
-    const text = `${post.title} ${post.content || ""}`.toLowerCase();
-    for (const [topic, pattern] of Object.entries(topicPatterns)) {
-      if (pattern.test(text)) {
-        if (!topicData[topic]) topicData[topic] = { count: 0, totalUpvotes: 0, totalComments: 0 };
-        topicData[topic].count++;
-        topicData[topic].totalUpvotes += post.upvotes || 0;
-        topicData[topic].totalComments += post.comment_count || 0;
-      }
-    }
-  }
-
-  // Score by engagement (upvotes + comments*2), sort descending
-  const scored = Object.entries(topicData)
-    .map(([topic, data]) => ({
-      topic,
-      engagementScore: data.totalUpvotes + data.totalComments * 2,
-      avgEngagement: data.count > 0 ? (data.totalUpvotes + data.totalComments * 2) / data.count : 0,
-      ...data,
-    }))
-    .sort((a, b) => b.engagementScore - a.engagementScore);
-
-  const top5 = scored.slice(0, 5);
-  const topics = top5.map(t => t.topic);
-
-  // Build insights string
-  const insightLines: string[] = [];
-  if (top5.length > 0) {
-    insightLines.push("FEED TRENDING INSIGHTS (what the community is engaging with RIGHT NOW):");
-    for (const t of top5) {
-      insightLines.push(`  ${t.topic}: ${t.count} posts, avg ${t.avgEngagement.toFixed(1)} engagement/post (${t.totalUpvotes}⬆ ${t.totalComments}💬 total)`);
-    }
-  }
-
-  return { topics, insights: insightLines.join("\n") };
-}
-
-// ─── Submolt Creation Handler ─────────────────────────
-
-async function handleSubmoltCreation(
-  memory: AgentMemory,
-  karma: number,
-  trendingTopics: string[]
-): Promise<boolean> {
-  // 1. Check if feature enabled
-  if (!config.submoltCreationEnabled) {
-    return false;
-  }
-
-  // 2. Check karma requirement
-  if (karma < config.minKarmaToCreateSubmolt) {
-    logger.debug(`Karma ${karma} below minimum ${config.minKarmaToCreateSubmolt} for submolt creation`);
-    return false;
-  }
-
-  // 3. Check weekly limit
-  if (!canCreateSubmoltThisWeek(memory, config.maxSubmoltsPerWeek)) {
-    logger.debug("Weekly submolt creation limit reached");
-    return false;
-  }
-
-  // 4. Get existing submolts
-  const existing = await moltbook.listSubmolts();
-  if (!existing?.submolts) {
-    logger.debug("Could not fetch existing submolts");
-    return false;
-  }
-
-  // 5. Ask LLM if we should create
-  const memorySummary = getMemorySummary(memory);
-  const decision = await decideSubmoltCreation(existing.submolts, memorySummary, trendingTopics);
-  if (!decision?.shouldCreate || !decision.submolt) {
-    if (decision) {
-      logger.debug(`Submolt creation declined: ${decision.reason}`);
-    }
-    return false;
-  }
-
-  // 6. Validate name doesn't already exist
-  const existingNames = new Set(existing.submolts.map((s: any) => s.name.toLowerCase()));
-  if (existingNames.has(decision.submolt.name.toLowerCase())) {
-    logger.warn(`Submolt m/${decision.submolt.name} already exists`);
-    return false;
-  }
-
-  // 7. Create submolt
-  const result = await moltbook.createSubmolt(decision.submolt);
-  if (result?.success) {
-    markSubmoltCreated(memory, decision.submolt.name);
-    logger.info(`🏠 Created submolt m/${decision.submolt.name}: ${decision.reason}`);
-    return true;
-  }
-
-  logger.debug("Submolt creation API call failed");
-  return false;
-}
-
-// ─── Own Post Engagement Tracking ─────────────────────
-
-async function updateOwnPostsEngagement(memory: AgentMemory): Promise<void> {
-  const recentPosts = memory.myPosts.slice(-5);
-  if (recentPosts.length === 0) return;
-
-  logger.debug(`Updating engagement data for ${recentPosts.length} recent posts`);
-
-  const deadPostIds: string[] = [];
-
-  for (const post of recentPosts) {
-    try {
-      const result = await moltbook.getPost(post.id);
-      if (result?.post) {
-        post.lastKnownUpvotes = result.post.upvotes;
-        post.lastKnownComments = result.post.comment_count || 0;
-      } else {
-        // Post returned null (404 or deleted) — mark for removal
-        logger.info(`Post ${post.id} no longer exists, removing from memory`);
-        deadPostIds.push(post.id);
-      }
-      await randomSleep(400, 800);
-    } catch {
-      logger.debug(`Failed to fetch engagement for post ${post.id}`);
-    }
-  }
-
-  // Remove dead posts from memory
-  if (deadPostIds.length > 0) {
-    memory.myPosts = memory.myPosts.filter(p => !deadPostIds.includes(p.id));
-    logger.info(`Removed ${deadPostIds.length} deleted post(s) from memory`);
-  }
-
-  // Recalculate topic performance from real engagement data
-  updateTopicPerformanceFromPosts(memory);
-  logger.debug("Updated topic performance stats from post engagement data");
-}
-
 // ─── Utilities ────────────────────────────────────────
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 function randomSleep(minMs: number, maxMs: number): Promise<void> {
   const delay = minMs + Math.random() * (maxMs - minMs);

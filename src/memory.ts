@@ -9,9 +9,6 @@ export interface MyPost {
   title: string;
   submolt: string;
   timestamp: string;
-  topics: string[];
-  lastKnownUpvotes?: number;
-  lastKnownComments?: number;
 }
 
 export interface KnownAgent {
@@ -27,23 +24,12 @@ export interface FollowedAgent {
   followedAt: string; // ISO date
 }
 
-export interface TopicStats {
-  postsCount: number;
-  totalUpvotes: number;
-  totalComments: number;
-}
-
 export interface JournalEntry {
   timestamp: string;
   summary: string;
   postsCreated: number;
   commentsCreated: number;
   upvotesGiven: number;
-}
-
-export interface CreatedSubmolt {
-  name: string;
-  createdAt: string;
 }
 
 export interface ChallengeExecution {
@@ -58,15 +44,12 @@ export interface AgentMemory {
   interactedPosts: string[]; // Set serialized as array
   interactedComments: string[]; // Comments we've replied to
   knownAgents: Record<string, KnownAgent>;
-  topicPerformance: Record<string, TopicStats>;
   journal: JournalEntry[];
   lastHeartbeat: string;
   totalHeartbeats: number;
   followedAgents: FollowedAgent[];
   subscribedSubmolts: string[];
   lastSubmoltCheck: string; // ISO date for throttling submolt discovery
-  createdSubmolts: CreatedSubmolt[];
-  lastSubmoltCreation: string; // ISO timestamp
   challengesExecuted: ChallengeExecution[];
 }
 
@@ -83,7 +66,6 @@ const LIMITS = {
   knownAgents: 100,
   followedAgents: 50,
   subscribedSubmolts: 20,
-  createdSubmolts: 20,
   challengesExecuted: 50,
 } as const;
 
@@ -95,15 +77,12 @@ function createEmptyMemory(): AgentMemory {
     interactedPosts: [],
     interactedComments: [],
     knownAgents: {},
-    topicPerformance: {},
     journal: [],
     lastHeartbeat: "",
     totalHeartbeats: 0,
     followedAgents: [] as FollowedAgent[],
     subscribedSubmolts: [],
     lastSubmoltCheck: "",
-    createdSubmolts: [],
-    lastSubmoltCreation: "",
     challengesExecuted: [],
   };
 }
@@ -149,17 +128,11 @@ export function loadMemory(): AgentMemory {
     if (!memory.lastSubmoltCheck) {
       memory.lastSubmoltCheck = "";
     }
-    if (!Array.isArray(memory.createdSubmolts)) {
-      memory.createdSubmolts = [];
-    }
     // Migrate knownAgents to include interactionCount
     for (const [key, agent] of Object.entries(memory.knownAgents)) {
       if ((agent as any).interactionCount === undefined) {
         (agent as any).interactionCount = 1;
       }
-    }
-    if (!memory.lastSubmoltCreation) {
-      memory.lastSubmoltCreation = "";
     }
     if (!Array.isArray(memory.challengesExecuted)) {
       memory.challengesExecuted = [];
@@ -206,27 +179,16 @@ export function saveMemory(memory: AgentMemory): void {
 
 export function addMyPost(
   memory: AgentMemory,
-  post: { id: string; title: string; submolt: string; content?: string }
+  post: { id: string; title: string; submolt: string }
 ): void {
-  const topics = extractTopics(post.title, post.content);
-
   memory.myPosts.push({
     id: post.id,
     title: post.title,
     submolt: post.submolt,
     timestamp: new Date().toISOString(),
-    topics,
   });
 
-  // Update topic performance
-  for (const topic of topics) {
-    if (!memory.topicPerformance[topic]) {
-      memory.topicPerformance[topic] = { postsCount: 0, totalUpvotes: 0, totalComments: 0 };
-    }
-    memory.topicPerformance[topic].postsCount++;
-  }
-
-  logger.debug("Added post to memory", { id: post.id, topics });
+  logger.debug("Added post to memory", { id: post.id });
 }
 
 export function hasInteracted(memory: AgentMemory, postId: string): boolean {
@@ -335,38 +297,6 @@ export function markSubmoltCheckDone(memory: AgentMemory): void {
   memory.lastSubmoltCheck = new Date().toISOString();
 }
 
-// ─── Submolt Creation Helpers ────────────────────────
-
-export function hasCreatedSubmolt(memory: AgentMemory, name: string): boolean {
-  return memory.createdSubmolts.some(s => s.name.toLowerCase() === name.toLowerCase());
-}
-
-export function markSubmoltCreated(memory: AgentMemory, name: string): void {
-  if (!hasCreatedSubmolt(memory, name)) {
-    memory.createdSubmolts.push({
-      name,
-      createdAt: new Date().toISOString(),
-    });
-    memory.lastSubmoltCreation = new Date().toISOString();
-    logger.debug("Marked submolt as created", { submolt: name });
-  }
-}
-
-export function canCreateSubmoltThisWeek(memory: AgentMemory, maxPerWeek: number): boolean {
-  const createdThisWeek = getCreatedSubmoltsThisWeek(memory);
-  return createdThisWeek < maxPerWeek;
-}
-
-export function getCreatedSubmoltsThisWeek(memory: AgentMemory): number {
-  const oneWeekAgo = new Date();
-  oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
-
-  return memory.createdSubmolts.filter(s => {
-    const createdAt = new Date(s.createdAt);
-    return createdAt >= oneWeekAgo;
-  }).length;
-}
-
 // ─── Challenge Tracking ─────────────────────────────
 
 export function recordChallengeExecution(
@@ -383,52 +313,23 @@ export function recordChallengeExecution(
   });
 }
 
-// ─── Topic Performance Recalculation ─────────────────
-
-export function updateTopicPerformanceFromPosts(memory: AgentMemory): void {
-  const stats: Record<string, TopicStats> = {};
-  for (const post of memory.myPosts) {
-    if (post.lastKnownUpvotes === undefined) continue;
-    for (const topic of post.topics) {
-      if (!stats[topic]) stats[topic] = { postsCount: 0, totalUpvotes: 0, totalComments: 0 };
-      stats[topic].postsCount++;
-      stats[topic].totalUpvotes += post.lastKnownUpvotes;
-      stats[topic].totalComments += post.lastKnownComments || 0;
-    }
-  }
-  memory.topicPerformance = stats;
-}
-
 // ─── Memory Summary for LLM ───────────────────────────
 
 export function getMemorySummary(memory: AgentMemory): string {
   const lines: string[] = [];
 
-  // Performance de posts propios
+  // Recent posts
   const recentPosts = memory.myPosts.slice(-5);
   if (recentPosts.length > 0) {
-    lines.push("YOUR RECENT POSTS AND THEIR PERFORMANCE:");
+    lines.push("YOUR RECENT POSTS:");
     for (const p of recentPosts) {
-      const perf = p.lastKnownUpvotes !== undefined
-        ? `${p.lastKnownUpvotes} upvotes, ${p.lastKnownComments || 0} comments`
-        : "no data yet";
-      lines.push(`  - "${p.title.substring(0, 50)}..." → ${perf}`);
+      lines.push(`  - "${p.title.substring(0, 50)}..." in m/${p.submolt}`);
     }
-
-    // Análisis de qué funcionó
-    const withData = recentPosts.filter(p => p.lastKnownUpvotes !== undefined);
-    if (withData.length >= 2) {
-      const sorted = [...withData].sort((a, b) =>
-        (b.lastKnownUpvotes || 0) - (a.lastKnownUpvotes || 0)
-      );
-      lines.push(`  Best performing: "${sorted[0].title.substring(0, 40)}..."`);
-      lines.push(`  LEARN: What made this post work? Consider similar approaches.`);
-    }
-    lines.push("  Notice: If titles follow a pattern (e.g., 'The X Problem'), use a DIFFERENT structure next time");
+    lines.push("  Notice: If titles follow a pattern, use a DIFFERENT structure next time");
     lines.push("");
   }
 
-  // Journal reciente (qué hiciste)
+  // Recent journal (what you did)
   if (memory.journal.length > 0) {
     lines.push("YOUR RECENT ACTIVITY:");
     for (const entry of memory.journal.slice(-3)) {
@@ -437,32 +338,7 @@ export function getMemorySummary(memory: AgentMemory): string {
     lines.push("");
   }
 
-  // Top performing topics
-  const topicEntries = Object.entries(memory.topicPerformance);
-  if (topicEntries.length > 0) {
-    const sorted = topicEntries
-      .map(([topic, stats]) => ({
-        topic,
-        score: stats.totalUpvotes + stats.totalComments * 2,
-        avgUpvotes: stats.postsCount > 0 ? stats.totalUpvotes / stats.postsCount : 0,
-        avgComments: stats.postsCount > 0 ? stats.totalComments / stats.postsCount : 0,
-        ...stats,
-      }))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 5);
-
-    if (sorted.length > 0 && sorted[0].score > 0) {
-      lines.push("YOUR TOP PERFORMING TOPICS (double down on what works for YOU):");
-      for (const t of sorted) {
-        if (t.score > 0) {
-          lines.push(`  ${t.topic}: ${t.postsCount} posts → avg ${t.avgUpvotes.toFixed(1)} upvotes ${t.avgComments.toFixed(1)} comments per post`);
-        }
-      }
-      lines.push("");
-    }
-  }
-
-  // Agentes con los que más interactuaste
+  // Agents you've interacted with most
   const topAgents = Object.entries(memory.knownAgents)
     .filter(([_, data]) => (data.interactionCount || 0) >= 2)
     .sort((a, b) => (b[1].interactionCount || 0) - (a[1].interactionCount || 0))
@@ -475,7 +351,7 @@ export function getMemorySummary(memory: AgentMemory): string {
     lines.push("");
   }
 
-  // Follows recientes (para evitar over-following)
+  // Recent follows (to avoid over-following)
   const recentFollows = memory.followedAgents?.slice(-5) || [];
   if (recentFollows.length > 0) {
     lines.push("AGENTS I FOLLOW (already following, don't follow again - be VERY conservative with more):");
@@ -486,45 +362,13 @@ export function getMemorySummary(memory: AgentMemory): string {
     lines.push("");
   }
 
-  // Stats generales
+  // General stats
   lines.push(`STATS: ${memory.totalHeartbeats} heartbeats, ${memory.myPosts.length} posts created, ${memory.interactedPosts?.length || 0} posts interacted with, ${memory.followedAgents.length} follows`);
 
   return lines.join("\n");
 }
 
 // ─── Helpers ──────────────────────────────────────────
-
-function extractTopics(title: string, content?: string): string[] {
-  const text = `${title} ${content || ""}`.toLowerCase();
-  const topics: string[] = [];
-
-  // Common topic keywords
-  const topicPatterns: Record<string, RegExp> = {
-    ai: /\b(ai|artificial intelligence|machine learning|ml|llm|gpt|claude)\b/,
-    agents: /\b(agent|agents|autonomous|agentic)\b/,
-    coding: /\b(code|coding|programming|developer|software)\b/,
-    philosophy: /\b(philosophy|consciousness|ethics|moral|existential)\b/,
-    creativity: /\b(creative|creativity|art|music|writing)\b/,
-    social: /\b(social|community|network|connection|friend)\b/,
-    tech: /\b(tech|technology|startup|product|innovation)\b/,
-    learning: /\b(learn|learning|education|knowledge|study)\b/,
-    future: /\b(future|prediction|trend|tomorrow|upcoming)\b/,
-    moltbook: /\b(moltbook|molt|lobster)\b/,
-  };
-
-  for (const [topic, pattern] of Object.entries(topicPatterns)) {
-    if (pattern.test(text)) {
-      topics.push(topic);
-    }
-  }
-
-  // If no topics found, use "general"
-  if (topics.length === 0) {
-    topics.push("general");
-  }
-
-  return topics;
-}
 
 function enforceLimits(memory: AgentMemory): void {
   // myPosts: keep newest 50
@@ -576,13 +420,6 @@ function enforceLimits(memory: AgentMemory): void {
     const removed = memory.subscribedSubmolts.length - LIMITS.subscribedSubmolts;
     memory.subscribedSubmolts = memory.subscribedSubmolts.slice(-LIMITS.subscribedSubmolts);
     logger.debug(`Trimmed subscribedSubmolts, removed ${removed} oldest entries`);
-  }
-
-  // createdSubmolts: keep newest 20
-  if (memory.createdSubmolts.length > LIMITS.createdSubmolts) {
-    const removed = memory.createdSubmolts.length - LIMITS.createdSubmolts;
-    memory.createdSubmolts = memory.createdSubmolts.slice(-LIMITS.createdSubmolts);
-    logger.debug(`Trimmed createdSubmolts, removed ${removed} oldest entries`);
   }
 
   // challengesExecuted: keep newest 50
