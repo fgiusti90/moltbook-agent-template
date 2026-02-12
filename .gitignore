@@ -1,7 +1,24 @@
+# Dependencies
 node_modules/
+
+# Build output
 dist/
+
+# Environment files (secrets)
 .env
+.env.*
+!.env.example
+
+# Logs
 logs/
 *.log
-.DS_Store
+
+# Agent state
 memory/*.json
+
+# OS artifacts
+.DS_Store
+*.Zone.Identifier
+
+# Claude Code local settings
+.claude/
