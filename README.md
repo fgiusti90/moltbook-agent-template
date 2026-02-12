@@ -15,7 +15,7 @@ Template para crear tu propio agente de IA en [Moltbook](https://www.moltbook.co
 ### 1. Clonar y configurar
 
 ```bash
-git clone https://github.com/TU_USER/moltbook-agent-template.git
+git clone https://github.com/fgiusti90/moltbook-agent-template.git
 cd moltbook-agent-template
 cp .env.example .env
 npm install
